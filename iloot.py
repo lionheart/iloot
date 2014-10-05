@@ -17,6 +17,10 @@ import struct
 import sys
 import urllib
 import urlparse
+import xml.parsers.expat
+import cookielib
+import requests
+import uuid
 
 import hurry.filesize
 from chunkserver_pb2 import FileGroups
@@ -26,8 +30,8 @@ from keystore.keybag import Keybag
 from pbuf import decode_protobuf_array, encode_protobuf_array
 from util import hexdump
 
-CLIENT_INFO = "<iPhone2,1> <iPhone OS;5.1.1;9B206> <com.apple.AppleAccount/1.0 ((null)/(null))>"
-USER_AGENT_UBD = "ubd (unknown version) CFNetwork/548.1.4 Darwin/11.0.0"
+CLIENT_INFO = "<iPhone2,1> <iPhone OS;5.1.1;9B206> <com.apple.AppleAccount/1.0 (com.apple.Preferences/1.0)>"
+USER_AGENT_UBD = "Settings/1.0 CFNetwork/711.0.6 Darwin/14.0.0"
 USER_AGENT_MOBILE_BACKUP = "MobileBackup/5.1.1 (9B206; iPhone3,1)"
 USER_AGENT_BACKUPD = "backupd (unknown version) CFNetwork/548.1.4 Darwin/11.0.0"
 CLIENT_INFO_BACKUP = "<N88AP> <iPhone OS;5.1.1;9B206> <com.apple.icloud.content/211.1 (com.apple.MobileBackup/9B206)>"
@@ -62,27 +66,6 @@ def decrypt_chunk(data, chunk_encryption_key, chunk_checksum):
 
     print "chunk decryption Failed"
     return None
-
-def plist_request(host, method, url, body, headers):
-    conn = HTTPSConnection(host)
-    request = conn.request(method, url, body, headers)
-    response = conn.getresponse()
-
-    data = response.read()
-    try:
-        plist_data = plistlib.readPlistFromString(data)
-    except:
-        plist_data = None
-
-    if response.status != 200:
-        if plist_data is None:
-            print "Request %s returned code %d" % (url, response.status)
-        else:
-            print "{}: {}".format(plist_data.title, plist_data.message)
-
-        return
-
-    return plist_data
 
 def probobuf_request(host, method, url, body, headers, msg=None):
     conn = HTTPSConnection(host)
@@ -470,22 +453,154 @@ def download_backup(login, password, output_folder, types, combined, itunes_styl
     print 'Working with %s : %s' % (login, password)
     print 'Output directory :', output_folder
 
-    auth = "Basic %s" % base64.b64encode("%s:%s" % (login, password))
-    authenticateResponse = plist_request("setup.icloud.com", "POST", "/setup/authenticate/$APPLE_ID$", "", {"Authorization": auth})
-    if not authenticateResponse:
-        # There was an error authenticating the user.
-        return
-
-    dsPrsID = authenticateResponse["appleAccountInfo"]["dsPrsID"]
-    auth = "Basic %s" % base64.b64encode("%s:%s" % (dsPrsID, authenticateResponse["tokens"]["mmeAuthToken"]))
-
     headers = {
-        'Authorization': auth,
         'X-MMe-Client-Info': CLIENT_INFO,
         'User-Agent': USER_AGENT_UBD
     }
-    account_settings = plist_request("setup.icloud.com", "POST", "/setup/get_account_settings", "", headers)
-    auth = "X-MobileMe-AuthToken %s" % base64.b64encode("%s:%s" % (dsPrsID, authenticateResponse["tokens"]["mmeAuthToken"]))
+
+    def auth_params(headers):
+        return {
+            'auth': (login, password),
+            'headers': headers
+        }
+
+    response = requests.post("https://setup.icloud.com/setup/authenticate/$APPLE_ID$",
+            **auth_params(headers=headers))
+
+    try:
+        data = plistlib.readPlistFromString(response.text)
+    except:
+        print "Invalid username or password"
+        return
+    else:
+        if response.status_code != 200:
+            # Most likely, this Apple ID has two-factor auth enabled.
+            data = plistlib.writePlistToString({
+                'apple-id': login,
+                'password': password
+            })
+
+            headers['Cookie'] = "repairSteps=gv."
+            headers['X-MMe-Country'] = "US"
+            headers['Content-Type'] = "application/x-plist"
+
+            session = requests.Session()
+            response = session.post("https://setup.icloud.com/setup/iosbuddy/ui/existingAppleIdTermsUI", data=data, **auth_params(headers))
+
+            devices = []
+            session_id = []
+            next_url = []
+
+            def start_element(name, attrs):
+                if name == "labelRow":
+                    sublabel = attrs.get('sublabel', attrs.get('subLabel'))
+                    devices.append({
+                        'label': attrs['label'],
+                        'value': attrs['value'],
+                        'sublabel': sublabel
+                    })
+                elif name == "serverInfo":
+                    session_id.append(attrs['session'])
+                elif name == "linkBarItem" and attrs['validationFunction'] == "validateEmailForm":
+                    next_url.append(attrs['url'])
+
+            parser = xml.parsers.expat.ParserCreate()
+            parser.StartElementHandler = start_element
+            parser.Parse(response.text.encode("utf-8"), True)
+
+            session_id = session_id[0]
+            next_url = next_url[0]
+
+            print "Which device would you like your two-factor code sent to?"
+            print ""
+            for i, device in enumerate(devices):
+                print "{}) {} ({})".format(i, device['label'], device['sublabel'])
+
+            print ""
+            index = int(raw_input("Enter code (0-{}): ".format(i)))
+            device = devices[index]
+
+            data = plistlib.writePlistToString({
+                'code-device': device['value'],
+                'serverInfo': {
+                    'session': session_id
+                }
+            })
+
+            response = session.post("https://setup.icloud.com" + next_url, data=data, **auth_params(headers))
+
+            session_id = []
+            next_url = []
+            def start_element_2(name, attrs):
+                if name == "linkBarItem":
+                    next_url.append(attrs['url'])
+                elif name == "serverInfo":
+                    session_id.append(attrs['session'])
+
+            parser_2 = xml.parsers.expat.ParserCreate()
+            parser_2.StartElementHandler = start_element_2
+            parser_2.Parse(response.text.encode("utf-8"), True)
+
+            session_id = session_id[0]
+            next_url = next_url[0]
+
+            """
+
+            next_url = []
+            def start_element_3(name, attrs):
+                if name == "pinView":
+                    next_url.append(attrs['url'])
+                elif name == "serverInfo":
+                    session_id.append(attrs['session'])
+
+            parser_3 = xml.parsers.expat.ParserCreate()
+            parser_3.StartElementHandler = start_element_3
+            parser_3.Parse(response.text.encode("utf-8"), True)
+
+            session_id = session_id[0]
+            next_url = next_url[0]
+            """
+
+            code = raw_input("Enter the four-digit verification code: ")
+
+            data = plistlib.writePlistToString({
+                'security-code': code,
+                'serverInfo': {
+                    'session': session_id
+                }
+            })
+
+            response = session.post("https://setup.icloud.com" + next_url, data=data, **auth_params(headers))
+            print "AAAA"
+            print response.text
+
+            client_uuid = str(uuid.uuid1()).upper()
+            data = plistlib.writePlistToString({
+                'protocolVersion': "1.0",
+                'userInfo': {
+                    'client-id': client_uuid,
+                    'language': "en",
+                    'timezone': "America/Chicago"
+                }
+            })
+
+            print data
+            print headers
+
+            headers['X-Apple-MD-M'] = ""
+            headers['X-Apple-MD'] = ""
+            headers['X-Mme-Nas-Qualify'] = ""
+
+            response = session.post("https://setup.icloud.com/setup/login_or_create_account", data=data, **auth_params(headers))
+            print "BBBBB"
+            print response.text
+
+    data = plistlib.readPlistFromString(response.text)
+    auth_token = data['tokens']['mmeAuthToken']
+    dsPrsID = data['appleAccountInfo']['dsPrsID']
+
+    account_settings = requests.post("https://setup.icloud.com/setup/get_account_settings", auth=(dsPrsID, auth_token), headers=headers)
+    auth = "X-MobileMe-AuthToken {}".format(base64.b64encode("{}:{}".format(dsPrsID, auth_token)))
     client = MobileBackupClient(account_settings, dsPrsID, auth, output_folder)
 
     client.combined = combined
